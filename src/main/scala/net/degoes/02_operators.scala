@@ -1,5 +1,9 @@
 package net.degoes
 
+import scala.util.Try
+import net.degoes.contact_processing.MappingResult.Success
+import net.degoes.contact_processing.MappingResult.Failure
+
 /*
  * INTRODUCTION
  *
@@ -63,7 +67,9 @@ object input_stream {
      * exhausted, it will close the first input stream, make the second
      * input stream, and continue reading from the second one.
      */
-    def ++(that: => IStream): IStream = ???
+    def ++(that: => IStream): IStream = IStream { () =>
+      new java.io.SequenceInputStream(self.createInputStream(), that.createInputStream())
+    }
 
     /**
      * EXERCISE 2
@@ -72,7 +78,8 @@ object input_stream {
      * try to create the first input stream, but if that fails by throwing
      * an exception, it will then try to create the second input stream.
      */
-    def orElse(that: => IStream): IStream = ???
+    def orElse(that: => IStream): IStream =
+      IStream(() => Try(self.createInputStream()) getOrElse that.createInputStream())
 
     /**
      * EXERCISE 3
@@ -81,7 +88,7 @@ object input_stream {
      * create the input stream, but wrap it in Java's `BufferedInputStream`
      * before returning it.
      */
-    def buffered: IStream = ???
+    def buffered: IStream = IStream(() => new java.io.BufferedInputStream(self.createInputStream()))
   }
   object IStream {
 
@@ -105,7 +112,8 @@ object input_stream {
    * `fragments` by concatenating them into one. Regardless of
    * where the data comes from, everything should be buffered.
    */
-  lazy val allData: IStream = ???
+  lazy val allData: IStream = (primary orElse IStream.suspend(fragments.foldLeft(IStream.empty)(_ ++ _))).buffered
+  //primary orElse IStream.suspend(fragments.reduce(_ ++ _)).buffered
 
   lazy val primary: IStream         = ???
   lazy val fragments: List[IStream] = ???
@@ -129,7 +137,7 @@ object email_filter {
      * Add an "and" operator that will match an email if both the first and
      * the second email filter match the email.
      */
-    def &&(that: EmailFilter): EmailFilter = ???
+    def &&(that: EmailFilter): EmailFilter = EmailFilter(email => self.matches(email) && that.matches(email))
 
     /**
      * EXERCISE 2
@@ -137,7 +145,7 @@ object email_filter {
      * Add an "or" operator that will match an email if either the first or
      * the second email filter match the email.
      */
-    def ||(that: EmailFilter): EmailFilter = ???
+    def ||(that: EmailFilter): EmailFilter = EmailFilter(email => self.matches(email) || that.matches(email))
 
     /**
      * EXERCISE 3
@@ -145,7 +153,7 @@ object email_filter {
      * Add a "negate" operator that will match an email if this email filter
      * does NOT match an email.
      */
-    def unary_! : EmailFilter = ???
+    def unary_! : EmailFilter = EmailFilter(email => !self.matches(email))
   }
   object EmailFilter {
     def senderIs(address: Address): EmailFilter = EmailFilter(_.sender == address)
@@ -165,7 +173,9 @@ object email_filter {
    * addressed to "john@doe.com". Build this filter up compositionally
    * by using the defined constructors and operators.
    */
-  lazy val emailFilter1 = ???
+  lazy val emailFilter1 = EmailFilter.subjectContains("discount") &&
+    EmailFilter.bodyContains("N95") &&
+    !EmailFilter.recipientIs(Address("john@doe.com"))
 }
 
 /**
@@ -306,7 +316,17 @@ object contact_processing {
      * then the result must also fail. Only if both schema mappings succeed
      * can the resulting schema mapping succeed.
      */
-    def +(that: SchemaMapping): SchemaMapping = ???
+    def +(that: SchemaMapping): SchemaMapping = SchemaMapping { csv =>
+      self.map(csv) match {
+        case Success(value, warnSelf) => {
+          that.map(value) match {
+            case Success(value, warnThat) => Success(value, warnSelf ++ warnThat)
+            case f                        => f
+          }
+        }
+        case f => f
+      }
+    }
 
     /**
      * EXERCISE 2
@@ -315,7 +335,16 @@ object contact_processing {
      * applying the effects of the first one, unless it fails, and in that
      * case, applying the effects of the second one.
      */
-    def orElse(that: SchemaMapping): SchemaMapping = ???
+    def orElse(that: SchemaMapping): SchemaMapping = SchemaMapping { csv =>
+      self.map(csv) match {
+        case Failure(errSelf) =>
+          that.map(csv) match {
+            case Failure(errThat) => Failure(errSelf ++ errThat)
+            case success          => success
+          }
+        case success => success
+      }
+    }
 
     /**
      * EXERCISE 3
@@ -324,7 +353,33 @@ object contact_processing {
      * preserve the specified column names & their original values in the
      * final result.
      */
-    def protect(columnNames: Set[String]): SchemaMapping = ???
+    def protect(columnNames: Set[String]): SchemaMapping = SchemaMapping { csv =>
+      val protectedColumns = csv.columnNames.filter(columnNames.contains)
+      val protectedValues  = protectedColumns.flatMap(csv.get(_))
+
+      val result = for {
+        values <- protectedValues
+        colums <- protectedColumns
+      } yield self.map(csv).map(_.add(colums, values))
+
+      def accumulate[A](list: List[MappingResult[ContactsCSV]]): MappingResult[ContactsCSV] =
+        list match {
+          case Nil => Failure(List("No values to accumulate"))
+          case head :: tail =>
+            tail.foldLeft(head) { (acc, next) =>
+              (next, acc) match {
+                case (Success(value, warnNext), Success(value2, warnAcc)) =>
+                  Success(value, warnNext ++ warnAcc)
+                case (Failure(errNext), Failure(errAcc)) => Failure(errNext ++ errAcc)
+                case (Failure(errNext), _)               => Failure(errNext)
+                case (_, Failure(errAcc))                => Failure(errAcc)
+              }
+            }
+        }
+
+      accumulate(result)
+
+    }
   }
   object SchemaMapping {
 
@@ -366,7 +421,12 @@ object contact_processing {
    * company's official schema for contacts, by composing schema mappings
    * constructed from constructors and composed & transformed operators.
    */
-  lazy val schemaMapping: SchemaMapping = ???
+  lazy val schemaMapping: SchemaMapping =
+    SchemaMapping.combine("fname", "lname")("full_name")(_ + " " + _) +
+      SchemaMapping.rename("email", "email_address") +
+      SchemaMapping.rename("street", "street_address") +
+      SchemaMapping.rename("postal", "postal_code") +
+      SchemaMapping.relocate("full_name", 0)
 
   val UserUploadSchema: SchemaCSV =
     SchemaCSV(List("email", "fname", "lname", "country", "street", "postal"))
@@ -490,7 +550,12 @@ object education {
      * Add a `+` operator that combines this quiz result with the specified
      * quiz result.
      */
-    def +(that: QuizResult): QuizResult = ???
+    def +(that: QuizResult): QuizResult = QuizResult(
+      self.correctPoints + that.correctPoints,
+      self.bonusPoints + that.bonusPoints,
+      self.wrongPoints + that.wrongPoints,
+      self.wrong ++ that.wrong
+    )
   }
   object QuizResult {
 
@@ -508,14 +573,18 @@ object education {
      *
      * Add an operator `+` that appends this quiz to the specified quiz.
      */
-    def +(that: Quiz): Quiz = ???
+    def +(that: Quiz): Quiz = Quiz { () =>
+      self.run() + that.run()
+    }
 
     /**
      * EXERCISE 3
      *
      * Add a unary operator `bonus` that marks this quiz as a bonus quiz.
      */
-    def bonus: Quiz = ???
+    def bonus: Quiz = Quiz { () =>
+      self.run().toBonus
+    }
 
     /**
      * EXERCISE 4
@@ -524,7 +593,9 @@ object education {
      * quiz, and if it returns true, will execute the `ifPass` quiz afterward; but otherwise, will
      * execute the `ifFail` quiz.
      */
-    def check(f: QuizResult => Boolean)(ifPass: Quiz, ifFail: Quiz): Quiz = ???
+    def check(f: QuizResult => Boolean)(ifPass: Quiz, ifFail: Quiz): Quiz = Quiz { () =>
+      if (f(self.run())) ifPass.run() else ifFail.run()
+    }
   }
   object Quiz {
     private def grade[A](f: String => A, checker: Checker[A]): QuizResult =
@@ -586,6 +657,11 @@ object education {
    * tough bonus question; and if the user fails the bonus question, fallback
    * to a simpler bonus question with fewer bonus points.
    */
+  val toughQ = Quiz(Question.TrueFalse("Do you like talking about a lot of things?", Checker.isTrue(20)))
+  val easyQ  = Quiz(Question.TrueFalse("Do you like talking about a few things?", Checker.isTrue(10)))
   lazy val exampleQuiz: Quiz =
-    Quiz(Question.TrueFalse("Is coffee the best hot beverage on planet earth?", Checker.isTrue(10)))
+    Quiz(Question.TrueFalse("Is coffee the best hot beverage on planet earth?", Checker.isTrue(10))) +
+      Quiz(Question.TrueFalse("Is Scala the best programming language on planet earth?", Checker.isFalse(10))) +
+      Quiz(Question.TrueFalse("Is TS also cool?", Checker.isTrue(10))) +
+      toughQ.check(_.correctPoints == 20)(Quiz.empty, easyQ).bonus
 }
